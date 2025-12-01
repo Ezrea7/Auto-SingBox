@@ -24,7 +24,7 @@ INIT_SYSTEM="" # 将存储 'systemd', 'openrc' 或 'direct'
 SERVICE_FILE="" # 将根据 INIT_SYSTEM 设置
 
 # 脚本元数据
-SCRIPT_VERSION="3.0" 
+SCRIPT_VERSION="5.0" 
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh" 
 
 # 全局状态变量
@@ -85,10 +85,9 @@ _detect_init_system() {
         INIT_SYSTEM="systemd"
         SERVICE_FILE="/etc/systemd/system/sing-box.service"
     else
-        INIT_SYSTEM="direct"
-        SERVICE_FILE="" # 在直接管理模式下无服务文件
-        _warning "未检测到 systemd 或 OpenRC。将使用直接进程管理模式。"
-        _warning "注意：在此模式下，sing-box 服务无法开机自启。"
+        _error "错误：未检测到 systemd 或 OpenRC 初始化系统。"
+        _error "本脚本已不再支持 Direct (直接进程) 模式，请确保您的系统支持服务管理。"
+        exit 1
     fi
     _info "检测到管理模式为: ${INIT_SYSTEM}"
 }
@@ -224,10 +223,6 @@ EOF
 }
 
 _create_service_files() {
-    if [ "$INIT_SYSTEM" == "direct" ]; then
-        _info "在直接管理模式下，无需创建服务文件。"
-        return
-    fi
     if [ -f "$SERVICE_FILE" ]; then return; fi
     
     _info "正在创建 ${INIT_SYSTEM} 服务文件..."
@@ -262,57 +257,6 @@ _manage_service() {
                 return
              fi
              rc-service sing-box "$action"
-            ;;
-        direct)
-            case "$action" in
-                start)
-                    if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null; then
-                        _warning "sing-box 似乎已在运行。"
-                        return
-                    fi
-                    touch "$LOG_FILE"
-                    nohup ${SINGBOX_BIN} run -c ${CONFIG_FILE} >> ${LOG_FILE} 2>&1 &
-                    echo $! > ${PID_FILE}
-                    sleep 1
-                    if ps -p "$(cat "$PID_FILE")" > /dev/null; then
-                        _success "sing-box 启动成功, PID: $(cat ${PID_FILE})。"
-                    else
-                        _error "sing-box 启动失败，请检查日志: ${LOG_FILE}"
-                        rm -f ${PID_FILE}
-                    fi
-                    ;;
-                stop)
-                    if [ ! -f "$PID_FILE" ]; then
-                        _warning "未找到 PID 文件，可能未在运行。"
-                        return
-                    fi
-                    local pid=$(cat "$PID_FILE")
-                    if ps -p $pid > /dev/null; then
-                        kill $pid
-                        sleep 1
-                        if ps -p $pid > /dev/null; then
-                           _warning "无法正常停止，正在强制终止..."
-                           kill -9 $pid
-                        fi
-                    else
-                        _warning "PID 文件中的进程 ($pid) 不存在。"
-                    fi
-                    rm -f ${PID_FILE}
-                    ;;
-                restart)
-                    _manage_service "stop"
-                    _manage_service "start"
-                    ;;
-                status)
-                    if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null; then
-                        _success "sing-box 正在运行, PID: $(cat ${PID_FILE})。"
-                    else
-                        _error "sing-box 未运行。"
-                    fi
-                    return
-                    ;;
-                 *) _error "无效的命令: $action"; return ;;
-            esac
             ;;
     esac
     _success "sing-box 服务已 $action"
@@ -379,9 +323,6 @@ _uninstall() {
                     rc-service $relay_service_name stop >/dev/null 2>&1
                     rc-update del $relay_service_name default >/dev/null 2>&1
                     rm -f /etc/init.d/${relay_service_name}
-                else
-                    # Direct 模式，尝试 kill (但此时 relay-install.sh 不在，只能清理配置)
-                    warn "无法自动停止 'direct' 模式服务，请手动停止。"
                 fi
                 rm -rf "$relay_config_dir"
             fi
@@ -409,9 +350,6 @@ _uninstall() {
                 echo -e "  ${YELLOW}5. 查看日志:${NC} journalctl -u ${relay_service_name} -f"
             elif [ -f "/sbin/openrc-run" ]; then
                 echo -e "  ${YELLOW}4. 重启服务:${NC} rc-service ${relay_service_name} restart"
-                echo -e "  ${YELLOW}5. 查看日志:${NC} tail -f ${relay_log_file}"
-            else # direct
-                echo -e "  ${YELLOW}4. 重启服务:${NC} bash ${relay_script_path} restart"
                 echo -e "  ${YELLOW}5. 查看日志:${NC} tail -f ${relay_log_file}"
             fi
             echo ""
@@ -596,31 +534,55 @@ _remove_node_from_yaml() {
 _add_vless_ws_tls() {
     _info "--- VLESS (WebSocket+TLS) 设置向导 ---"
     
-    # 步骤 1: 获取连接地址 (用于 server 字段)
-    _info "请输入客户端用于“连接”的地址:"
-    _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-    _info "  - (其他)   您也可以手动输入一个IP或域名 (例如：xxx.123456.xyz)"
-    read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+    # --- 步骤 1: 模式选择 ---
+    echo "请选择连接模式："
+    echo "  1. 直连模式 (回车默认, 适合直连使用)"
+    echo "  2. 优选域名/IP模式 (适合IP被墙或者需要优选加速)"
+    read -p "请输入选项 [1/2]: " mode_choice
     
-    # 如果用户回车，则使用 $server_ip，否则使用用户输入的值
-    local client_server_addr=${connection_address:-$server_ip}
-    
-    # 如果用的是IP，且是IPv6，自动加上方括号
-    if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
-         client_server_addr="[${client_server_addr}]"
+    local client_server_addr=""
+    local is_cdn_mode=false
+
+    if [ "$mode_choice" == "2" ]; then
+        # --- CDN 模式逻辑 ---
+        is_cdn_mode=true
+        _info "您选择了 [优选域名/IP模式]。"
+        _info "请输入优选域名或优选IP"
+        read -p "请输入 (回车默认 www.csgo.com): " cdn_input
+        client_server_addr=${cdn_input:-"www.csgo.com"}
+    else
+        # --- 直连模式逻辑 ---
+        _info "您选择了 [直连模式]。"
+        _info "请输入客户端用于“连接”的地址:"
+        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
+        _info "  - (其他)   您也可以手动输入一个IP或域名"
+        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+        client_server_addr=${connection_address:-$server_ip}
+        
+        # IPv6 处理
+        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
+             client_server_addr="[${client_server_addr}]"
+        fi
     fi
 
-    # 步骤 2: 获取伪装域名 (用于 SNI 和 Host)
+    # --- 步骤 2: 获取伪装域名 ---
     _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
     _info " (例如: xxx.987654.xyz)"
     read -p "请输入伪装域名: " camouflage_domain
     [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
-    # 步骤 3: 端口
-    read -p "请输入监听端口 : " port
+    # --- 步骤 3: 端口 (VPS监听端口) ---
+    read -p "请输入监听端口 (直连模式下填写已经映射的端口，优选模式下填写CF回源设置的端口): " port
     [[ -z "$port" ]] && _error "端口不能为空" && return 1
 
-    # 步骤 4: 路径
+    # 确定客户端连接端口
+    local client_port="$port"
+    if [ "$is_cdn_mode" == "true" ]; then
+        client_port="443"
+        _info "检测到 优选域名/IP模式 ，客户端连接端口已自动设置为: 443"
+    fi
+
+    # --- 步骤 4: 路径 ---
     read -p "请输入 WebSocket 路径 (回车则随机生成): " ws_path
     if [ -z "$ws_path" ]; then
         ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
@@ -629,7 +591,7 @@ _add_vless_ws_tls() {
         [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
     fi
 
-    # 步骤 5: 证书文件
+    # --- 步骤 5: 证书文件 ---
     _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
     _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
     _info "  - (或)   使用 Cloudflare 源服务器证书"
@@ -639,7 +601,7 @@ _add_vless_ws_tls() {
     read -p "请输入私钥文件 .key 的完整路径: " key_path
     [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
     
-    # 步骤 6: 跳过验证
+    # --- 步骤 6: 跳过验证 ---
     read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
     local skip_verify=false
     if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
@@ -647,15 +609,19 @@ _add_vless_ws_tls() {
         _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
     fi
     
-    # [!] 新增：自定义名称
+    # [!] 自定义名称 (核心修改点)
     local default_name="VLESS-WS-${port}"
+    if [ "$is_cdn_mode" == "true" ]; then 
+        default_name="VLESS-CDN-443" 
+    fi
+    
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
 
     local uuid=$(${SINGBOX_BIN} generate uuid)
     local tag="vless-ws-in-${port}"
     
-    # Inbound (服务器端) 配置: 使用 伪装域名 对应的证书
+    # Inbound (服务器端) 配置: 使用 $port
     local inbound_json=$(jq -n \
         --arg t "$tag" \
         --arg p "$port" \
@@ -681,11 +647,11 @@ _add_vless_ws_tls() {
         }')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
 
-    # Proxy (客户端) 配置: 
+    # Proxy (客户端) 配置: 使用 $client_port (CDN模式为443)
     local proxy_json=$(jq -n \
             --arg n "$name" \
             --arg s "$client_server_addr" \
-            --arg p "$port" \
+            --arg p "$client_port" \
             --arg u "$uuid" \
             --arg sn "$camouflage_domain" \
             --arg wsp "$ws_path" \
@@ -713,38 +679,63 @@ _add_vless_ws_tls() {
     _add_node_to_yaml "$proxy_json"
     _success "VLESS (WebSocket+TLS) 节点 [${name}] 添加成功!"
     _success "客户端连接地址 (server): ${client_server_addr}"
+    _success "客户端连接端口 (port): ${client_port}"
     _success "客户端伪装域名 (servername/Host): ${camouflage_domain}"
-    _success "客户端 UDP 转发已启用。"
+    if [ "$is_cdn_mode" == "true" ]; then
+        _success "优选域名/IP模式已应用。请确保 Cloudflare 回源规则将流量指向本机端口: ${port}"
+    fi
 }
 
 _add_trojan_ws_tls() {
     _info "--- Trojan (WebSocket+TLS) 设置向导 ---"
     
-    # 步骤 1: 获取连接地址 (用于 server 字段)
-    _info "请输入客户端用于“连接”的地址:"
-    _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-    _info "  - (其他)   您也可以手动输入一个IP或域名 (例如：xxx.123456.xyz)"
-    read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+    # --- 步骤 1: 模式选择 ---
+    echo "请选择连接模式："
+    echo "  1. 直连模式 (回车默认, 适合直连使用)"
+    echo "  2. 优选域名/IP模式 (适合IP被墙或者需要优选加速)"
+    read -p "请输入选项 [1/2]: " mode_choice
     
-    # 如果用户回车，则使用 $server_ip，否则使用用户输入的值
-    local client_server_addr=${connection_address:-$server_ip}
-    
-    # 如果用的是IP，且是IPv6，自动加上方括号
-    if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
-         client_server_addr="[${client_server_addr}]"
+    local client_server_addr=""
+    local is_cdn_mode=false
+
+    if [ "$mode_choice" == "2" ]; then
+        # --- CDN 模式逻辑 ---
+        is_cdn_mode=true
+        _info "您选择了 [优选域名/IP模式]。"
+        _info "请输入优选域名或优选IP"
+        read -p "请输入 (回车默认 www.csgo.com): " cdn_input
+        client_server_addr=${cdn_input:-"www.csgo.com"}
+    else
+        # --- 直连模式逻辑 ---
+        _info "您选择了 [直连模式]。"
+        _info "请输入客户端用于“连接”的地址:"
+        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+        client_server_addr=${connection_address:-$server_ip}
+        
+        # IPv6 处理
+        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
+             client_server_addr="[${client_server_addr}]"
+        fi
     fi
 
-    # 步骤 2: 获取伪装域名 (用于 SNI 和 Host)
+    # --- 步骤 2: 获取伪装域名 ---
     _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
     _info " (例如: xxx.987654.xyz)"
     read -p "请输入伪装域名: " camouflage_domain
     [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
-    # 步骤 3: 端口
-    read -p "请输入监听端口 : " port
+    # --- 步骤 3: 端口 (VPS监听端口) ---
+    read -p "请输入监听端口 (直连模式下填写已经映射的端口，优选模式下填写CF回源设置的端口): " port
     [[ -z "$port" ]] && _error "端口不能为空" && return 1
 
-    # 步骤 4: 路径
+    # 确定客户端连接端口
+    local client_port="$port"
+    if [ "$is_cdn_mode" == "true" ]; then
+        client_port="443"
+        _info "检测到 优选域名/IP模式 ，客户端连接端口已自动设置为: 443"
+    fi
+
+    # --- 步骤 4: 路径 ---
     read -p "请输入 WebSocket 路径 (回车则随机生成): " ws_path
     if [ -z "$ws_path" ]; then
         ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
@@ -753,17 +744,15 @@ _add_trojan_ws_tls() {
         [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
     fi
 
-    # 步骤 5: 证书文件 (逻辑同 vless-ws-tls)
+    # --- 步骤 5: 证书文件 ---
     _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-    _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-    _info "  - (或)   使用 Cloudflare 源服务器证书"
     read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
     [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
 
     read -p "请输入私钥文件 .key 的完整路径: " key_path
     [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
     
-    # 步骤 6: 跳过验证 (逻辑同 vless-ws-tls)
+    # --- 步骤 6: 跳过验证 ---
     read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
     local skip_verify=false
     if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
@@ -771,21 +760,25 @@ _add_trojan_ws_tls() {
         _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
     fi
 
-    # [!] Trojan: 使用密码，而非UUID
+    # [!] Trojan: 使用密码
     read -p "请输入 Trojan 密码 (回车则随机生成): " password
     if [ -z "$password" ]; then
         password=$(${SINGBOX_BIN} generate rand --hex 16)
         _info "已为您生成随机密码: ${password}"
     fi
 
-    # [!] 新增：自定义名称
+    # [!] 自定义名称 (核心修改点)
     local default_name="Trojan-WS-${port}"
+    if [ "$is_cdn_mode" == "true" ]; then 
+        default_name="Trojan-CDN-443" 
+    fi
+    
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
 
     local tag="trojan-ws-in-${port}"
     
-    # Inbound (服务器端) 配置: (不变，是正确的)
+    # Inbound (服务器端) 配置: 使用 $port
     local inbound_json=$(jq -n \
         --arg t "$tag" \
         --arg p "$port" \
@@ -811,11 +804,11 @@ _add_trojan_ws_tls() {
         }')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
 
-    # [!!!] 修复：修改 Proxy (clash.yaml) 配置
+    # Proxy (客户端) 配置: 使用 $client_port
     local proxy_json=$(jq -n \
             --arg n "$name" \
             --arg s "$client_server_addr" \
-            --arg p "$port" \
+            --arg p "$client_port" \
             --arg pw "$password" \
             --arg sn "$camouflage_domain" \
             --arg wsp "$ws_path" \
@@ -842,8 +835,11 @@ _add_trojan_ws_tls() {
     _add_node_to_yaml "$proxy_json"
     _success "Trojan (WebSocket+TLS) 节点 [${name}] 添加成功!"
     _success "客户端连接地址 (server): ${client_server_addr}"
+    _success "客户端连接端口 (port): ${client_port}"
     _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
-    _success "客户端 UDP 转发已启用。"
+    if [ "$is_cdn_mode" == "true" ]; then
+        _success "优选域名/IP模式已应用。请确保 Cloudflare 回源规则将流量指向本机端口: ${port}"
+    fi
 }
 
 _add_vless_reality() {
@@ -1131,7 +1127,9 @@ _view_nodes() {
                     local client_port=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .port' ${CLASH_YAML_FILE} | head -n 1)
                     local ws_path=$(echo "$node" | jq -r '.transport.path')
                     local encoded_path=$(_url_encode "$ws_path")
-                    local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .servername' ${CLASH_YAML_FILE} | head -n 1)
+                    
+                    # [!] 修复BUG：这里原来是 .servername，对于 Trojan 应该读取 .sni
+                    local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
                     
                     # [!] 已修改：使用 display_name
                     url="trojan://$(_url_encode "$password")@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}&sni=${sni}#$(_url_encode "$display_name")"
@@ -1372,25 +1370,21 @@ _generate_relay_script() {
         local tag=$(echo "$line" | jq -r '.tag')
         local port=$(echo "$line" | jq -r '.listen_port')
         local method=$(echo "$line" | jq -r '.method')
-        local type="shadowsocks" # 过滤时已确定
+        local type="shadowsocks"
 
         # --- 名称查找逻辑 ---
         local proxy_name_to_find=""
-        # 1. 优先通过端口在clash.yaml中精确查找
         local proxy_obj_by_port=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}')' ${CLASH_YAML_FILE} | head -n 1)
         if [ -n "$proxy_obj_by_port" ]; then
              proxy_name_to_find=$(echo "$proxy_obj_by_port" | ${YQ_BINARY} eval '.name' -)
         fi
-        # 2. 如果第一步失败 (例如端口复用)，则结合端口和类型查找
         if [[ -z "$proxy_name_to_find" ]]; then
             proxy_name_to_find=$(${YQ_BINARY} eval '.proxies[] | select(.port == '${port}' and .type == "ss") | .name' ${CLASH_YAML_FILE} | head -n 1)
         fi
-        
-        # 3. 使用找到的自定义名称，如果找不到则回退到 tag
         local display_name=${proxy_name_to_find:-$tag} 
         
         echo -e " ${CYAN}$i)${NC} ${display_name} (端口: ${port}, 方法: ${method})"
-        ss_options+=("$line") # 存储完整的 JSON 对象
+        ss_options+=("$line")
         ((i++))
     done <<< "$ss_inbounds"
     echo " 0) 返回"
@@ -1410,17 +1404,144 @@ _generate_relay_script() {
     
     _success "已选择落地节点：${INBOUND_IP}:${INBOUND_PORT} (方法: ${INBOUND_METHOD})"
 
-    # --- [!] 已修改：不再询问，直接调用 hybrid ---
+    # 4. 生成脚本
     _info "--- 正在生成 [混合模式] 模板 (第 2/2 步) ---"
     local RELAY_SCRIPT_PATH="/root/relay-install.sh"
     
     _generate_relay_script_hybrid "$INBOUND_IP" "$INBOUND_PORT" "$INBOUND_METHOD" "$INBOUND_PASSWORD" "$RELAY_SCRIPT_PATH"
     
-    # --- 后续的输出信息 (这部分逻辑不变) ---
     if [ $? -eq 0 ]; then
         echo ""
         _success "✅ 线路机脚本已成功生成在: ${RELAY_SCRIPT_PATH}"
-        _info "请将此文件从“落地机”传输到“线路机”的 /root 目录。"
+        
+        # --- [新增] 临时 HTTP 服务器逻辑 ---
+        echo ""
+        _info "为了方便传输，是否在本机开启临时的 HTTP 下载服务器？"
+        _info "开启后，您将获得一个 http://IP:端口/relay-install.sh 的链接。"
+        _info "您只需在线路机的 [菜单 10] 中输入该链接即可自动下载。"
+        
+        read -p "$(echo -e ${YELLOW}"是否开启临时下载服务? (y/N): "${NC})" enable_http
+        
+        if [[ "$enable_http" == "y" || "$enable_http" == "Y" ]]; then
+            # 定义标记变量：是否由脚本安装了python
+            local installed_python_by_script=false
+
+            # --- 1. 检测 Python3 ---
+            if ! command -v python3 &>/dev/null; then
+                _warning "未检测到 python3，正在尝试自动安装..."
+                if [ -f /etc/alpine-release ]; then
+                    if apk update && apk add --no-cache python3; then
+                        installed_python_by_script=true
+                    fi
+                elif command -v apt-get &>/dev/null; then
+                    if apt-get update && apt-get install -y python3; then
+                        installed_python_by_script=true
+                    fi
+                elif command -v yum &>/dev/null; then
+                    if yum install -y python3; then
+                        installed_python_by_script=true
+                    fi
+                fi
+            else
+                _info "检测到系统已存在 Python3，跳过安装。"
+            fi
+
+            # --- 2. 再次检查 ---
+            if ! command -v python3 &>/dev/null; then
+                _error "Python3 安装失败，无法开启临时服务。请手动传输文件。"
+            else
+                # --- 3. 准备 IP 和 端口 ---
+                echo ""
+                _info "正在检测本机 IP 地址..."
+                local local_ips=$(ip addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1)
+                echo -e "本机可用 IP 列表:\n${CYAN}${local_ips}${NC}"
+                
+                [ -z "$server_ip" ] && _get_public_ip
+                read -p "请输入 HTTP 服务使用的 IP (回车默认 ${server_ip}): " user_ip
+                local bind_ip=${user_ip:-$server_ip}
+
+                local random_port=$(shuf -i 10000-60000 -n 1)
+                read -p "请输入 HTTP 服务端口 (回车默认随机 ${random_port}): " user_port
+                local http_port=${user_port:-$random_port}
+
+                if ! [[ "$http_port" =~ ^[0-9]+$ ]] || [ "$http_port" -lt 1 ] || [ "$http_port" -gt 65535 ]; then
+                    _warning "输入的端口无效 ($user_port)，已自动切换回随机端口: ${random_port}"
+                    http_port=$random_port
+                fi
+                
+                local download_url="http://${bind_ip}:${http_port}/relay-install.sh"
+                
+                echo ""
+                echo -e "${GREEN}====================================================${NC}"
+                echo -e "  临时下载服务已开启 (按 Ctrl+C 停止)"
+                echo -e "  下载链接: ${YELLOW}${download_url}${NC}"
+                echo -e "${GREEN}====================================================${NC}"
+                _warning "注意：请确保防火墙已放行 TCP 端口: ${http_port}"
+                _info "正在运行 HTTP 服务... 请现在去线路机操作 [菜单 10]。"
+                _info "线路机下载完成后，请回到这里按 Ctrl+C 关闭服务。"
+                
+                local temp_web_dir=$(mktemp -d)
+                cp "$RELAY_SCRIPT_PATH" "$temp_web_dir/relay-install.sh"
+                
+                pushd "$temp_web_dir" >/dev/null
+                python3 -m http.server "$http_port"
+                popd >/dev/null
+                
+                # --- [重点] 服务结束后的清理逻辑 ---
+                # 立即屏蔽 SIGINT (Ctrl+C) 信号，防止用户多按跳过询问
+                trap '' SIGINT
+
+                rm -rf "$temp_web_dir"
+                echo "" 
+                _info "HTTP 服务已关闭，临时文件已清理。"
+
+                # 只有当 Python 是由本脚本安装时，才询问是否卸载
+                if [ "$installed_python_by_script" = true ]; then
+                    echo ""
+                    _warning "检测到 Python3 是由本脚本刚刚为您安装的。"
+                    _warning "为了节省空间，建议将其卸载。"
+                    
+                    while true; do
+                        # 使用 -r 防止反斜杠转义
+                        read -r -p "$(echo -e ${YELLOW}"是否彻底卸载 Python3 及其依赖? (y/N): "${NC})" confirm_uninstall
+                        case "$confirm_uninstall" in
+                            [yY]|[yY][eE][sS])
+                                _info "正在彻底卸载 Python3..."
+                                if [ -f /etc/alpine-release ]; then
+                                    apk del python3
+                                elif command -v apt-get &>/dev/null; then
+                                    apt-get remove -y python3 python3-minimal
+                                    apt-get autoremove -y
+                                elif command -v yum &>/dev/null; then
+                                    yum remove -y python3
+                                fi
+                                _success "Python3 已成功卸载并清理。"
+                                break
+                                ;;
+                            [nN]|[nN][oO]|"")
+                                _info "已保留 Python3。"
+                                break
+                                ;;
+                            *)
+                                # 如果用户输入其他字符（包括狂按回车），提示重试
+                                echo "请输入 y 或 n 进行确认。"
+                                ;;
+                        esac
+                    done
+                else
+                    _info "系统原有的 Python3 将被保留。"
+                fi
+
+                # 恢复信号处理 (虽然函数马上结束了，但这是一个好习惯)
+                trap - SIGINT
+                return
+            fi
+        fi
+        # --- [新增] 逻辑结束 ---
+
+        echo ""
+        _info "如果不使用链接下载，请手动传输文件："
+        _info "请将 ${RELAY_SCRIPT_PATH} 传输到线路机的 /root 目录。"
         _info "然后在“线路机”上执行: chmod +x ${RELAY_SCRIPT_PATH} && ${RELAY_SCRIPT_PATH}"
         echo ""
         _warning "如需卸载此中转机配置，请在线路机上执行: bash ${RELAY_SCRIPT_PATH} uninstall"
@@ -1494,9 +1615,6 @@ action_uninstall() {
             rc-update del $SERVICE_NAME default >/dev/null 2>&1
             rm -f /etc/init.d/${SERVICE_NAME}
             ;;
-        direct)
-            if [ -f "$PID_FILE" ]; then kill $(cat "$PID_FILE") >/dev/null 2>&1 || true; fi
-            ;;
     esac
     info "服务 [${SERVICE_NAME}] 已停止并移除。"
     rm -rf "$CONFIG_DIR" 
@@ -1563,22 +1681,18 @@ action_view() {
 _detect_init_system() {
     if [ -f "/sbin/openrc-run" ]; then echo "openrc";
     elif [ -d "/run/systemd/system" ] && command -v systemctl &>/dev/null; then echo "systemd";
-    else echo "direct"; fi
+    else echo "unknown"; fi 
 }
 _restart_relay_service() {
     local INIT_SYSTEM=$(_detect_init_system)
+    if [ "$INIT_SYSTEM" == "unknown" ]; then 
+        err "不支持的系统 init"
+        exit 1
+    fi
     info "正在使用 $INIT_SYSTEM 模式重启 [${SERVICE_NAME}]..."
     case "$INIT_SYSTEM" in
         systemd) systemctl restart $SERVICE_NAME ;;
         openrc) rc-service $SERVICE_NAME restart ;;
-        direct)
-            if [ -f "$PID_FILE" ]; then
-                kill $(cat "$PID_FILE") >/dev/null 2>&1 || true
-                rm -f "$PID_FILE"
-            fi
-            nohup $SINGBOX_BIN run -c $CONFIG_FILE >> $LOG_FILE 2>&1 &
-            echo $! > $PID_FILE
-            ;;
     esac
     sleep 1
     info "服务已重启。"
@@ -1865,16 +1979,16 @@ action_delete() {
     
     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     
-    # [!] 智能删除链接
+    # [!] 智能删除链接 (修复：使用 sed 替代 grep -v，解决删除唯一行失败的问题)
     if [ "$type_to_del" == "vless" ] && [ -f "$LINK_FILE_VLESS" ]; then
         info "正在从 VLESS 链接列表删除..."
-        grep -v "^${tag_to_del}:" "$LINK_FILE_VLESS" > "$LINK_FILE_VLESS.tmp" && mv "$LINK_FILE_VLESS.tmp" "$LINK_FILE_VLESS"
+        sed -i "/^${tag_to_del}:/d" "$LINK_FILE_VLESS"
     elif [ "$type_to_del" == "hysteria2" ] && [ -f "$LINK_FILE_HY2" ]; then
         info "正在从 Hysteria2 链接列表删除..."
-        grep -v "^${tag_to_del}:" "$LINK_FILE_HY2" > "$LINK_FILE_HY2.tmp" && mv "$LINK_FILE_HY2.tmp" "$LINK_FILE_HY2"
+        sed -i "/^${tag_to_del}:/d" "$LINK_FILE_HY2"
     elif [ "$type_to_del" == "tuic" ] && [ -f "$LINK_FILE_TUIC" ]; then
         info "正在从 TUICv5 链接列表删除..."
-        grep -v "^${tag_to_del}:" "$LINK_FILE_TUIC" > "$LINK_FILE_TUIC.tmp" && mv "$LINK_FILE_TUIC.tmp" "$LINK_FILE_TUIC"
+        sed -i "/^${tag_to_del}:/d" "$LINK_FILE_TUIC"
     fi
     
     # [!] 智能删除证书 (Hy2 和 TUICv5)
@@ -2197,19 +2311,6 @@ SVC
         rc-service $SERVICE_NAME restart
         info "OpenRC 服务 [${SERVICE_NAME}] 已启动"
         ;;
-    direct)
-        info "使用 direct 模式 (nohup) 启动..."
-        touch "$LOG_FILE"
-        if [ -f "$PID_FILE" ]; then kill $(cat "$PID_FILE") >/dev/null 2>&1 || true; rm -f "$PID_FILE"; fi
-        nohup $SINGBOX_BIN run -c $CONFIG_FILE >> $LOG_FILE 2>&1 &
-        echo $! > $PID_FILE
-        sleep 1
-        if ps -p "$(cat $PID_FILE)" > /dev/null; then
-            info "Direct 模式启动成功, PID: $(cat ${PID_FILE}). 日志: ${LOG_FILE}"
-        else
-            err "Direct 模式启动失败! 请检查日志: ${LOG_FILE}"; tail -n 20 $LOG_FILE
-        fi
-        ;;
 esac
 
 # --- (安装流程) 输出结果 ---
@@ -2267,14 +2368,39 @@ _manage_relay_installation() {
     _info "--- 线路机脚本管理 (请在线路机上运行) ---"
     local relay_script="/root/relay-install.sh"
 
+    # --- [新增] 自动下载逻辑 ---
     if [ ! -f "$relay_script" ]; then
-        _error "错误：未在 /root 目录下找到 [relay-install.sh] 脚本。"
-        _info "  1. 请先在您的“落地机”上运行此脚本 (singbox.sh)。"
-        _info "  2. 使用 [9) 生成中转落地脚本] 选项。"
-        _info "  3. 将“落地机”上生成的 [/root/relay-install.sh] 脚本"
-        _info "     传输到本机 (线路机) 的 /root 目录下，然后再试。"
-        return 1
+        _warning "未在 /root 目录下找到 [relay-install.sh] 脚本。"
+        _info "如果您已经在落地机生成了下载链接，请输入链接进行自动下载。"
+        echo ""
+        read -p "请输入下载链接 (直接回车则退出): " download_url
+        
+        if [ -n "$download_url" ]; then
+            _info "正在从 $download_url 下载脚本..."
+            # 尝试下载
+            if wget -O "$relay_script" "$download_url"; then
+                if [ -s "$relay_script" ]; then
+                    _success "下载成功！"
+                    chmod +x "$relay_script"
+                else
+                    _error "下载的文件为空，请检查链接或网络。"
+                    rm -f "$relay_script"
+                    return 1
+                fi
+            else
+                _error "下载失败，请检查防火墙设置或链接是否正确。"
+                rm -f "$relay_script" # 清理可能残留的空文件
+                return 1
+            fi
+        else
+            _error "未输入链接，操作取消。"
+            _info "  1. 请先在您的“落地机”上运行此脚本 (singbox.sh)。"
+            _info "  2. 使用 [9) 生成中转落地脚本] 选项并开启 HTTP 服务。"
+            _info "  3. 将生成的 http://... 链接填入此处。"
+            return 1
+        fi
     fi
+    # --- [新增] 逻辑结束 ---
 
     chmod +x "$relay_script" # 确保有执行权限
 
@@ -2285,7 +2411,7 @@ _manage_relay_installation() {
         _info "      (正在管理: ${relay_script})"
         echo "===================================================="
         echo -e "  1) ${GREEN}安装 / 重置${NC} 第一个中转服务"
-        echo -e "  2) ${GREEN}添加${NC} 新的中转路由 (VLESS / Hy2)"
+        echo -e "  2) ${GREEN}添加${NC} 新的中转路由 (VLESS / Hy2 / Tuic)"
         echo -e "  3) ${YELLOW}删除${NC} 一个指定的中转路由"
         echo -e "  4. ${CYAN}查看${NC} 所有中转节点链接"
         echo -e "  5) ${CYAN}重启${NC} 线路机服务"
