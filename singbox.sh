@@ -1174,15 +1174,12 @@ _view_nodes() {
                 url="tuic://${uuid}:${pw}@${display_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
                 ;;
             "shadowsocks")
-                local m=$(echo "$node" | jq -r '.method'); local pw=$(echo "$node" | jq -r '.password')
-                if [[ "$m" == "2022-blake3-aes-128-gcm" ]]; then
-                     # [!] 已修改：使用 display_name
-                     url="ss://$(_url_encode "${m}:${pw}")@${display_ip}:${port}#$(_url_encode "$display_name")"
-                else
-                    local b64=$(echo -n "${m}:${pw}" | base64 | tr -d '\n')
-                    # [!] 已修改：使用 display_name
-                    url="ss://${b64}@${display_ip}:${port}#$(_url_encode "$display_name")"
-                fi
+                local method=$(echo "$node" | jq -r '.method')
+                local password=$(echo "$node" | jq -r '.password')
+                
+                # 保持原格式：ss://method:password@server:port#name (URL编码)
+                # [!] 已修改：使用 display_name
+                url="ss://$(_url_encode "${method}:${password}")@${display_ip}:${port}#$(_url_encode "$display_name")"
                 ;;
             "socks")
                 local u=$(echo "$node" | jq -r '.users[0].username'); local p=$(echo "$node" | jq -r '.users[0].password')
@@ -1277,6 +1274,13 @@ _delete_node() {
         return
     fi
     
+    # === 关键修复：必须先读取 metadata 判断节点类型，再删除！===
+    local node_metadata=$(jq -r --arg tag "$tag_to_del" '.[$tag] // empty' "$METADATA_FILE" 2>/dev/null)
+    local node_type=""
+    if [ -n "$node_metadata" ]; then
+        node_type=$(echo "$node_metadata" | jq -r '.type // empty')
+    fi
+    
     # [!] 已修改：使用索引从 config.json 中删除
     _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[${index}])" || return
     _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_del\")" || return # Metadata 仍然使用 tag，这是正确的
@@ -1295,6 +1299,39 @@ _delete_node() {
             rm -f "$cert_to_del" "$key_to_del"
         fi
     fi
+    
+    # === 根据之前读取的节点类型清理相关配置 ===
+    if [ "$node_type" == "third-party-adapter" ]; then
+        # === 第三方适配层：删除 outbound 和 route ===
+        _info "检测到第三方适配层，正在清理关联配置..."
+        
+        # 先查找对应的 outbound (必须在删除 route 之前)
+        local outbound_tag=$(jq -r --arg inbound "$tag_to_del" '.route.rules[] | select(.inbound == $inbound) | .outbound' "$CONFIG_FILE" 2>/dev/null | head -n 1)
+        
+        # 删除 route 规则
+        _atomic_modify_json "$CONFIG_FILE" "del(.route.rules[] | select(.inbound == \"$tag_to_del\"))" || true
+        
+        # 删除对应的 outbound
+        if [ -n "$outbound_tag" ] && [ "$outbound_tag" != "null" ]; then
+            _atomic_modify_json "$CONFIG_FILE" "del(.outbounds[] | select(.tag == \"$outbound_tag\"))" || true
+            _info "已删除关联的 outbound: $outbound_tag"
+        fi
+    else
+        # === 普通节点：只有 inbound，没有额外的 outbound 和 route ===
+        # 主脚本创建的节点通常只包含 inbound，outbound 是全局的（如 direct）
+        # 如果有特殊的 outbound（如某些协议的专用配置），也要删除
+        
+        # 检查是否有基于此 inbound 的 route 规则（通常不应该有，但为了清理干净）
+        local has_route=$(jq -e ".route.rules[]? | select(.inbound == \"$tag_to_del\")" "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$has_route" ]; then
+            _info "检测到关联的路由规则，正在清理..."
+            _atomic_modify_json "$CONFIG_FILE" "del(.route.rules[] | select(.inbound == \"$tag_to_del\"))" || true
+        fi
+        
+        # 注意：不删除任何 outbound，因为普通节点的 outbound 通常是共享的全局 outbound
+        # （如 "direct"），删除会影响其他节点
+    fi
+    # === 清理逻辑结束 ===
     
     _success "节点 ${display_name_to_del} 已删除！"
     _manage_service "restart"
@@ -1449,6 +1486,590 @@ _modify_port() {
     _manage_service "restart"
 }
 
+# 第三方节点导入功能
+_import_third_party_node() {
+    _info "--- 导入第三方节点 ---"
+    echo "支持的协议：VLESS-Reality, Hysteria2, TUIC, Shadowsocks"
+    echo ""
+    
+    read -p "请粘贴第三方节点分享链接: " third_party_link
+    
+    if [ -z "$third_party_link" ]; then
+        _error "链接为空"
+        return
+    fi
+    
+    # 识别协议类型
+    local protocol=""
+    if [[ "$third_party_link" =~ ^vless:// ]]; then
+        protocol="vless"
+    elif [[ "$third_party_link" =~ ^hysteria2:// ]]; then
+        protocol="hysteria2"
+    elif [[ "$third_party_link" =~ ^tuic:// ]]; then
+        protocol="tuic"
+    elif [[ "$third_party_link" =~ ^ss:// ]]; then
+        protocol="shadowsocks"
+    else
+        _error "不支持的协议！仅支持: vless, hysteria2, tuic, ss"
+        return
+    fi
+    
+    _info "识别协议: ${protocol}"
+    
+    # 解析链接
+    local parse_result=""
+    case "$protocol" in
+        "vless")
+            parse_result=$(_parse_vless_link "$third_party_link")
+            ;;
+        "hysteria2")
+            parse_result=$(_parse_hysteria2_link "$third_party_link")
+            ;;
+        "tuic")
+            parse_result=$(_parse_tuic_link "$third_party_link")
+            ;;
+        "shadowsocks")
+            parse_result=$(_parse_shadowsocks_link "$third_party_link")
+            ;;
+    esac
+    
+    if [ -z "$parse_result" ]; then
+        _error "链接解析失败"
+        return
+    fi
+    
+    # 显示解析结果
+    local node_name=$(echo "$parse_result" | jq -r '.name')
+    local server=$(echo "$parse_result" | jq -r '.server')
+    local port=$(echo "$parse_result" | jq -r '.port')
+    
+    echo ""
+    _success "解析成功！"
+    echo "节点名称: ${node_name}"
+    echo "服务器: ${server}:${port}"
+    echo "协议: ${protocol}"
+    echo ""
+    
+    # 选择本地适配协议
+    echo "请选择本地适配协议（用于中转）:"
+    echo "  1) VLESS-TCP（推荐）"
+    echo "  2) Shadowsocks (aes-256-gcm)"
+    echo "  3) Shadowsocks (2022-blake3-aes-128-gcm)"
+    read -p "请输入选项 [1-3]: " adapter_choice
+    
+    local adapter_type=""
+    local adapter_method=""
+    case "$adapter_choice" in
+        1) adapter_type="vless" ;;
+        2) adapter_type="shadowsocks"; adapter_method="aes-256-gcm" ;;
+        3) adapter_type="shadowsocks"; adapter_method="2022-blake3-aes-128-gcm" ;;
+        *) _error "无效选项"; return ;;
+    esac
+    
+    # 分配本地端口
+    read -p "请输入本地监听端口 (回车随机): " local_port
+    if [ -z "$local_port" ]; then
+        local_port=$(shuf -i 10000-20000 -n 1)
+    fi
+    
+    # 检查端口冲突
+    if jq -e ".inbounds[] | select(.listen_port == $local_port)" "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "端口 $local_port 已被占用！"
+        return
+    fi
+    
+    # 自定义适配层名称
+    local adapter_type_name="VLESS-TCP"
+    if [ "$adapter_type" == "shadowsocks" ]; then
+        adapter_type_name="SS-${adapter_method}"
+    fi
+    
+    local default_adapter_name="Adapter-${node_name}-${adapter_type_name}"
+    echo ""
+    _info "即将创建本地适配层: 127.0.0.1:${local_port} (${adapter_type})"
+    read -p "请输入适配层名称 (回车使用: ${default_adapter_name}): " custom_adapter_name
+    
+    local adapter_name="${custom_adapter_name:-$default_adapter_name}"
+    
+    _info "本地适配层: ${adapter_name}"
+    
+    # 生成配置
+    _create_third_party_adapter "$protocol" "$parse_result" "$adapter_type" "$adapter_method" "$local_port" "$adapter_name"
+}
+
+# 解析 VLESS 链接
+_parse_vless_link() {
+    local link="$1"
+    
+    # vless://uuid@server:port?param1=value1&param2=value2#name
+    local uuid=$(echo "$link" | sed 's|vless://\([^@]*\)@.*|\1|')
+    local server=$(echo "$link" | sed 's|.*@\([^:]*\):.*|\1|')
+    local port=$(echo "$link" | sed 's|.*:\([0-9]*\)?.*|\1|')
+    local params=$(echo "$link" | sed 's|.*?\([^#]*\).*|\1|')
+    local name=$(echo "$link" | sed 's|.*#\(.*\)|\1|' | sed 's/%20/ /g; s/%2F/\//g; s/%3A/:/g')
+    
+    # 解析参数
+    local flow=""
+    local security=""
+    local sni=""
+    local pbk=""
+    local sid=""
+    local fp="chrome"
+    
+    IFS='&' read -ra PARAM_ARRAY <<< "$params"
+    for param in "${PARAM_ARRAY[@]}"; do
+        local key=$(echo "$param" | cut -d= -f1)
+        local value=$(echo "$param" | cut -d= -f2-)
+        case "$key" in
+            "flow") flow="$value" ;;
+            "security") security="$value" ;;
+            "sni"|"servername") sni="$value" ;;
+            "pbk") pbk="$value" ;;
+            "sid") sid="$value" ;;
+            "fp") fp="$value" ;;
+        esac
+    done
+    
+    # 检查是否为 Reality
+    if [ "$security" != "reality" ]; then
+        _error "仅支持 VLESS-Reality 协议"
+        return 1
+    fi
+    
+    # 生成 JSON
+    jq -n \
+        --arg name "$name" \
+        --arg server "$server" \
+        --arg port "$port" \
+        --arg uuid "$uuid" \
+        --arg flow "$flow" \
+        --arg sni "$sni" \
+        --arg pbk "$pbk" \
+        --arg sid "$sid" \
+        --arg fp "$fp" \
+        '{name:$name,server:$server,port:($port|tonumber),uuid:$uuid,flow:$flow,sni:$sni,pbk:$pbk,sid:$sid,fp:$fp}'
+}
+
+# 解析 Hysteria2 链接
+_parse_hysteria2_link() {
+    local link="$1"
+    
+    # hysteria2://password@server:port?param1=value1#name
+    local password=$(echo "$link" | sed 's|hysteria2://\([^@]*\)@.*|\1|')
+    local server_part=$(echo "$link" | sed 's|hysteria2://[^@]*@\([^?#]*\).*|\1|')
+    
+    # 分离 server 和 port
+    local server=$(echo "$server_part" | cut -d: -f1)
+    local port=$(echo "$server_part" | cut -d: -f2)
+    
+    # 提取参数
+    local params=""
+    if [[ "$link" == *"?"* ]]; then
+        params=$(echo "$link" | sed 's|[^?]*?\([^#]*\).*|\1|')
+    fi
+    
+    # 提取名称
+    local name=""
+    if [[ "$link" == *"#"* ]]; then
+        name=$(echo "$link" | sed 's|.*#\(.*\)|\1|' | sed 's/%20/ /g; s/%2F/\//g; s/%3A/:/g')
+    fi
+    
+    local sni=""
+    local insecure="0"
+    
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAM_ARRAY <<< "$params"
+        for param in "${PARAM_ARRAY[@]}"; do
+            local key=$(echo "$param" | cut -d= -f1)
+            local value=$(echo "$param" | cut -d= -f2-)
+            case "$key" in
+                "sni") sni="$value" ;;
+                "insecure") insecure="$value" ;;
+            esac
+        done
+    fi
+    
+    # 验证必需字段
+    if [ -z "$password" ] || [ -z "$server" ] || [ -z "$port" ]; then
+        _error "Hysteria2 链接解析失败，缺少必需字段"
+        return 1
+    fi
+    
+    # 验证端口是数字
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        _error "端口号无效: $port"
+        return 1
+    fi
+    
+    jq -n \
+        --arg name "$name" \
+        --arg server "$server" \
+        --arg port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg insecure "$insecure" \
+        '{name:$name,server:$server,port:($port|tonumber),password:$password,sni:$sni,insecure:($insecure|tonumber)}'
+}
+
+# 解析 TUIC 链接
+_parse_tuic_link() {
+    local link="$1"
+    
+    # tuic://uuid:password@server:port?param1=value1#name
+    local uuid=$(echo "$link" | sed 's|tuic://\([^:]*\):.*|\1|')
+    local password=$(echo "$link" | sed 's|tuic://[^:]*:\([^@]*\)@.*|\1|')
+    local server_part=$(echo "$link" | sed 's|tuic://[^@]*@\([^?#]*\).*|\1|')
+    
+    # 分离 server 和 port
+    local server=$(echo "$server_part" | cut -d: -f1)
+    local port=$(echo "$server_part" | cut -d: -f2)
+    
+    # 提取参数
+    local params=""
+    if [[ "$link" == *"?"* ]]; then
+        params=$(echo "$link" | sed 's|[^?]*?\([^#]*\).*|\1|')
+    fi
+    
+    # 提取名称
+    local name=""
+    if [[ "$link" == *"#"* ]]; then
+        name=$(echo "$link" | sed 's|.*#\(.*\)|\1|' | sed 's/%20/ /g; s/%2F/\//g; s/%3A/:/g')
+    fi
+    
+    local sni=""
+    local cc="bbr"
+    local insecure="1"  # 第三方节点默认跳过证书验证
+    
+    if [ -n "$params" ]; then
+        IFS='&' read -ra PARAM_ARRAY <<< "$params"
+        for param in "${PARAM_ARRAY[@]}"; do
+            local key=$(echo "$param" | cut -d= -f1)
+            local value=$(echo "$param" | cut -d= -f2-)
+            case "$key" in
+                "sni") sni="$value" ;;
+                "congestion_control"|"cc") cc="$value" ;;
+                "insecure"|"allow_insecure") insecure="$value" ;;
+            esac
+        done
+    fi
+    
+    # 如果没有 SNI，使用服务器地址
+    if [ -z "$sni" ]; then
+        sni="$server"
+    fi
+    
+    # 验证必需字段
+    if [ -z "$uuid" ] || [ -z "$password" ] || [ -z "$server" ] || [ -z "$port" ]; then
+        _error "TUIC 链接解析失败，缺少必需字段"
+        return 1
+    fi
+    
+    # 验证端口是数字
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        _error "端口号无效: $port"
+        return 1
+    fi
+    
+    jq -n \
+        --arg name "$name" \
+        --arg server "$server" \
+        --arg port "$port" \
+        --arg uuid "$uuid" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg cc "$cc" \
+        --arg insecure "$insecure" \
+        '{name:$name,server:$server,port:($port|tonumber),uuid:$uuid,password:$password,sni:$sni,cc:$cc,insecure:($insecure|tonumber)}'
+}
+
+# 解析 Shadowsocks 链接
+_parse_shadowsocks_link() {
+    local link="$1"
+    
+    # Step 1: URL解码
+    local decoded_link="$link"
+    decoded_link="${decoded_link//%3A/:}"
+    decoded_link="${decoded_link//%2B/+}"
+    decoded_link="${decoded_link//%3D/=}"
+    decoded_link="${decoded_link//%2F//}"
+    
+    # Step 2: 提取名称
+    local name=""
+    if [[ "$decoded_link" == *"#"* ]]; then
+        name="${decoded_link##*#}"
+    fi
+    
+    # Step 3: 移除 # 和 ? 部分
+    decoded_link="${decoded_link%%\?*}"
+    decoded_link="${decoded_link%%#*}"
+    
+    # Step 4: 提取 ss:// 后的部分
+    local ss_body="${decoded_link#ss://}"
+    
+    # Step 5: 分离 @ 前后
+    local method password server port
+    
+    if [[ "$ss_body" == *"@"* ]]; then
+        # 格式: prefix@server:port
+        local prefix="${ss_body%%@*}"
+        local server_port="${ss_body##*@}"
+        
+        # 提取 server 和 port
+        server="${server_port%:*}"
+        port="${server_port##*:}"
+        
+        # 判断 prefix 是否是 Base64（尝试解码）
+        local decoded_prefix=$(echo -n "$prefix" | base64 -d 2>/dev/null)
+        
+        if [ -n "$decoded_prefix" ] && [[ "$decoded_prefix" == *":"* ]]; then
+            # Base64 格式
+            method="${decoded_prefix%%:*}"
+            password="${decoded_prefix#*:}"
+        else
+            # 明文格式
+            method="${prefix%%:*}"
+            password="${prefix#*:}"
+        fi
+    else
+        # 格式: ss://base64(method:password@server:port)
+        local decoded=$(echo -n "$ss_body" | base64 -d 2>/dev/null)
+        
+        if [ -z "$decoded" ]; then
+            echo "解码失败" >&2
+            return 1
+        fi
+        
+        # 提取 method:password@server:port
+        local method_pass="${decoded%%@*}"
+        local server_port="${decoded##*@}"
+        
+        method="${method_pass%%:*}"
+        password="${method_pass#*:}"
+        server="${server_port%:*}"
+        port="${server_port##*:}"
+    fi
+    
+    # 清理空白字符
+    method=$(echo "$method" | xargs)
+    password=$(echo "$password" | xargs)
+    server=$(echo "$server" | xargs)
+    port=$(echo "$port" | xargs)
+    name=$(echo "$name" | xargs)
+    
+    # 调试信息输出到 stderr（不会被 $() 捕获）
+    echo "解析结果: method=$method, server=$server, port=$port, name=$name" >&2
+    
+    # 验证
+    if [ -z "$method" ] || [ -z "$password" ] || [ -z "$server" ] || [ -z "$port" ]; then
+        echo "解析失败：缺少必需字段" >&2
+        return 1
+    fi
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo "端口无效: [$port]" >&2
+        return 1
+    fi
+    
+    # 只有这一行输出到 stdout（被 $() 捕获）
+    jq -n \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg method "$method" \
+        --arg password "$password" \
+        '{name:$name,server:$server,port:$port,method:$method,password:$password}'
+}
+
+# 创建第三方节点适配层
+_create_third_party_adapter() {
+    local third_party_protocol="$1"
+    local third_party_config="$2"
+    local adapter_type="$3"
+    local adapter_method="$4"
+    local local_port="$5"
+    local adapter_name="$6"  # 新增：自定义名称
+    
+    local adapter_tag="adapter-${adapter_type}-${local_port}"
+    local outbound_tag="third-party-${third_party_protocol}-${local_port}"
+    
+    # 1. 创建本地适配层 Inbound
+    local adapter_inbound=""
+    if [ "$adapter_type" == "vless" ]; then
+        local adapter_uuid=$(${SINGBOX_BIN} generate uuid)
+        adapter_inbound=$(jq -n \
+            --arg tag "$adapter_tag" \
+            --arg port "$local_port" \
+            --arg uuid "$adapter_uuid" \
+            '{type:"vless",tag:$tag,listen:"127.0.0.1",listen_port:($port|tonumber),users:[{uuid:$uuid}],tls:{enabled:false}}')
+    else
+        # Shadowsocks
+        local adapter_password=$(${SINGBOX_BIN} generate rand --hex 16)
+        if [ "$adapter_method" == "2022-blake3-aes-128-gcm" ]; then
+            adapter_password=$(${SINGBOX_BIN} generate rand --base64 16)
+        fi
+        adapter_inbound=$(jq -n \
+            --arg tag "$adapter_tag" \
+            --arg port "$local_port" \
+            --arg method "$adapter_method" \
+            --arg password "$adapter_password" \
+            '{type:"shadowsocks",tag:$tag,listen:"127.0.0.1",listen_port:($port|tonumber),method:$method,password:$password}')
+    fi
+    
+    # 2. 创建第三方节点 Outbound
+    local third_party_outbound=""
+    case "$third_party_protocol" in
+        "vless")
+            local server=$(echo "$third_party_config" | jq -r '.server')
+            local port=$(echo "$third_party_config" | jq -r '.port')
+            local uuid=$(echo "$third_party_config" | jq -r '.uuid')
+            local flow=$(echo "$third_party_config" | jq -r '.flow')
+            local sni=$(echo "$third_party_config" | jq -r '.sni')
+            local pbk=$(echo "$third_party_config" | jq -r '.pbk')
+            local sid=$(echo "$third_party_config" | jq -r '.sid')
+            local fp=$(echo "$third_party_config" | jq -r '.fp')
+            
+            third_party_outbound=$(jq -n \
+                --arg tag "$outbound_tag" \
+                --arg server "$server" \
+                --arg port "$port" \
+                --arg uuid "$uuid" \
+                --arg flow "$flow" \
+                --arg sni "$sni" \
+                --arg pbk "$pbk" \
+                --arg sid "$sid" \
+                --arg fp "$fp" \
+                '{type:"vless",tag:$tag,server:$server,server_port:($port|tonumber),uuid:$uuid,flow:$flow,packet_encoding:"xudp",tls:{enabled:true,server_name:$sni,reality:{enabled:true,public_key:$pbk,short_id:$sid},utls:{enabled:true,fingerprint:$fp}}}')
+            ;;
+        "hysteria2")
+            local server=$(echo "$third_party_config" | jq -r '.server')
+            local port=$(echo "$third_party_config" | jq -r '.port')
+            local password=$(echo "$third_party_config" | jq -r '.password')
+            local sni=$(echo "$third_party_config" | jq -r '.sni')
+            local insecure_raw=$(echo "$third_party_config" | jq -r '.insecure')
+            local insecure="false"
+            [[ "$insecure_raw" == "1" ]] && insecure="true"
+            
+            third_party_outbound=$(jq -n \
+                --arg tag "$outbound_tag" \
+                --arg server "$server" \
+                --arg port "$port" \
+                --arg password "$password" \
+                --arg sni "$sni" \
+                --argjson insecure "$insecure" \
+                '{type:"hysteria2",tag:$tag,server:$server,server_port:($port|tonumber),password:$password,tls:{enabled:true,server_name:$sni,insecure:$insecure,alpn:["h3"]}}')
+            ;;
+        "tuic")
+            local server=$(echo "$third_party_config" | jq -r '.server')
+            local port=$(echo "$third_party_config" | jq -r '.port')
+            local uuid=$(echo "$third_party_config" | jq -r '.uuid')
+            local password=$(echo "$third_party_config" | jq -r '.password')
+            local sni=$(echo "$third_party_config" | jq -r '.sni')
+            local cc=$(echo "$third_party_config" | jq -r '.cc')
+            local insecure_raw=$(echo "$third_party_config" | jq -r '.insecure')
+            local insecure="false"
+            [[ "$insecure_raw" == "1" ]] && insecure="true"
+            
+            third_party_outbound=$(jq -n \
+                --arg tag "$outbound_tag" \
+                --arg server "$server" \
+                --arg port "$port" \
+                --arg uuid "$uuid" \
+                --arg password "$password" \
+                --arg sni "$sni" \
+                --arg cc "$cc" \
+                --argjson insecure "$insecure" \
+                '{type:"tuic",tag:$tag,server:$server,server_port:($port|tonumber),uuid:$uuid,password:$password,congestion_control:$cc,tls:{enabled:true,server_name:$sni,insecure:$insecure,alpn:["h3"]}}')
+            ;;
+        "shadowsocks")
+            local server=$(echo "$third_party_config" | jq -r '.server')
+            local port=$(echo "$third_party_config" | jq -r '.port')
+            local method=$(echo "$third_party_config" | jq -r '.method')
+            local password=$(echo "$third_party_config" | jq -r '.password')
+            
+            third_party_outbound=$(jq -n \
+                --arg tag "$outbound_tag" \
+                --arg server "$server" \
+                --arg port "$port" \
+                --arg method "$method" \
+                --arg password "$password" \
+                '{type:"shadowsocks",tag:$tag,server:$server,server_port:($port|tonumber),method:$method,password:$password}')
+            ;;
+    esac
+    
+    # 3. 创建路由规则
+    local route_rule=$(jq -n \
+        --arg inbound "$adapter_tag" \
+        --arg outbound "$outbound_tag" \
+        '{inbound:$inbound,outbound:$outbound}')
+    
+    # 4. 写入配置
+    _info "正在写入配置..."
+    
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$adapter_inbound]" || return
+    _atomic_modify_json "$CONFIG_FILE" ".outbounds = [$third_party_outbound] + .outbounds" || return
+    
+    # 确保 route 存在
+    if ! jq -e '.route' "$CONFIG_FILE" >/dev/null; then
+        _atomic_modify_json "$CONFIG_FILE" '. += {"route":{"rules":[]}}' || return
+    fi
+    if ! jq -e '.route.rules' "$CONFIG_FILE" >/dev/null; then
+        _atomic_modify_json "$CONFIG_FILE" '.route.rules = []' || return
+    fi
+    
+    _atomic_modify_json "$CONFIG_FILE" ".route.rules += [$route_rule]" || return
+    
+    # 5. 保存元数据
+    local node_name=$(echo "$third_party_config" | jq -r '.name')
+    local metadata=$(jq -n \
+        --arg type "third-party-adapter" \
+        --arg source_protocol "$third_party_protocol" \
+        --arg source_name "$node_name" \
+        --arg adapter_name "$adapter_name" \
+        --arg adapter_type "$adapter_type" \
+        --arg adapter_port "$local_port" \
+        --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
+        '{type:$type,source_protocol:$source_protocol,source_name:$source_name,adapter_name:$adapter_name,adapter_type:$adapter_type,adapter_port:($adapter_port|tonumber),created_at:$created}')
+    
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$adapter_tag\": $metadata}" || return
+    
+    # 6. 添加到 clash.yaml
+    if [ "$adapter_type" == "vless" ]; then
+        local adapter_uuid=$(echo "$adapter_inbound" | jq -r '.users[0].uuid')
+        local proxy_json=$(jq -n \
+            --arg name "$adapter_name" \
+            --arg port "$local_port" \
+            --arg uuid "$adapter_uuid" \
+            '{name:$name,type:"vless",server:"127.0.0.1",port:($port|tonumber),uuid:$uuid,tls:false,network:"tcp"}')
+    else
+        local adapter_password=$(echo "$adapter_inbound" | jq -r '.password')
+        local proxy_json=$(jq -n \
+            --arg name "$adapter_name" \
+            --arg port "$local_port" \
+            --arg method "$adapter_method" \
+            --arg password "$adapter_password" \
+            '{name:$name,type:"ss",server:"127.0.0.1",port:($port|tonumber),cipher:$method,password:$password}')
+    fi
+    
+    _add_node_to_yaml "$proxy_json"
+    
+    _success "第三方节点导入成功！"
+    echo ""
+    echo "本地适配层信息："
+    echo "  地址: 127.0.0.1:${local_port}"
+    echo "  协议: ${adapter_type}"
+    if [ "$adapter_type" == "vless" ]; then
+        echo "  UUID: $(echo "$adapter_inbound" | jq -r '.users[0].uuid')"
+    else
+        echo "  加密: ${adapter_method}"
+        echo "  密码: $(echo "$adapter_inbound" | jq -r '.password')"
+    fi
+    echo ""
+    _info "此节点现在可作为落地机进行中转配置！"
+    _info "请使用「进阶功能」生成 Token 并配置中转。"
+    
+    _manage_service "restart"
+}
+
 # 新增更新脚本及SingBox核心
 _update_script() {
     _info "--- 更新此管理脚本 ---"
@@ -1553,42 +2174,44 @@ _main_menu() {
         echo "  2) 查看节点分享链接"
         echo "  3) 删除节点"
         echo "  4) 修改节点端口"
+        echo "  5) 导入第三方节点"
         echo "----------------------------------------------------"
         _info "【服务控制】"
-        echo "  5) 重启 sing-box"
-        echo "  6) 停止 sing-box"
-        echo "  7) 查看 sing-box 运行状态"
-        echo "  8) 查看 sing-box 实时日志"
+        echo "  6) 重启 sing-box"
+        echo "  7) 停止 sing-box"
+        echo "  8) 查看 sing-box 运行状态"
+        echo "  9) 查看 sing-box 实时日志"
         echo "----------------------------------------------------"
         _info "【脚本与配置】"
-        echo "  9) 检查配置文件"
+        echo " 10) 检查配置文件"
         echo "----------------------------------------------------"
         _info "【更新与卸载】"
-        echo -e " 10) ${GREEN}更新脚本${NC}"
-        echo -e " 11) ${GREEN}更新 Sing-box 核心${NC}"
-        echo -e " 12) ${RED}卸载 sing-box 及脚本${NC}"
+        echo -e " 11) ${GREEN}更新脚本${NC}"
+        echo -e " 12) ${GREEN}更新 Sing-box 核心${NC}"
+        echo -e " 13) ${RED}卸载 sing-box 及脚本${NC}"
         echo "----------------------------------------------------"
         _info "【进阶功能】"
-        echo -e " 13) ${CYAN}进阶功能 (落地/中转配置)${NC}"
+        echo -e " 14) ${CYAN}进阶功能 (落地/中转配置)${NC}"
         echo "----------------------------------------------------"
         echo "  0) 退出脚本"
         echo "===================================================="
-        read -p "请输入选项 [0-13]: " choice
+        read -p "请输入选项 [0-14]: " choice
 
         case $choice in
             1) _show_add_node_menu ;;
             2) _view_nodes ;;
             3) _delete_node ;;
             4) _modify_port ;;
-            5) _manage_service "restart" ;;
-            6) _manage_service "stop" ;;
-            7) _manage_service "status" ;;
-            8) _view_log ;;
-            9) _check_config ;;
-            10) _update_script ;;
-            11) _update_singbox_core ;;
-            12) _uninstall ;; 
-            13) _advanced_features ;;
+            5) _import_third_party_node ;;
+            6) _manage_service "restart" ;;
+            7) _manage_service "stop" ;;
+            8) _manage_service "status" ;;
+            9) _view_log ;;
+            10) _check_config ;;
+            11) _update_script ;;
+            12) _update_singbox_core ;;
+            13) _uninstall ;; 
+            14) _advanced_features ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
