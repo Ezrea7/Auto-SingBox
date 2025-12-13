@@ -181,7 +181,7 @@ Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 [Service]
-ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE}
+ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c /etc/singbox/relay.json
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -191,32 +191,22 @@ EOF
 }
 
 _create_openrc_service() {
+    # 确保日志文件存在
+    touch "${LOG_FILE}"
+    
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
 
 description="sing-box service"
 command="${SINGBOX_BIN}"
-command_args="run -c ${CONFIG_FILE}"
-command_user="root"
+command_args="run -c ${CONFIG_FILE} -c /etc/singbox/relay.json"
+command_background=true
 pidfile="${PID_FILE}"
+start_stop_daemon_args="--stdout ${LOG_FILE} --stderr ${LOG_FILE}"
 
 depend() {
     need net
     after firewall
-}
-
-start() {
-    ebegin "Starting sing-box"
-    start-stop-daemon --start --background \\
-        --make-pidfile --pidfile \${pidfile} \\
-        --exec \${command} -- \${command_args} >> "${LOG_FILE}" 2>&1
-    eend \$?
-}
-
-stop() {
-    ebegin "Stopping sing-box"
-    start-stop-daemon --stop --pidfile \${pidfile}
-    eend \$?
 }
 EOF
     chmod +x "$SERVICE_FILE"
@@ -408,8 +398,20 @@ _uninstall() {
 
 _initialize_config_files() {
     mkdir -p ${SINGBOX_DIR}
-    [ -s "$CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > "$CONFIG_FILE"
+    [ -s "$CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}}' > "$CONFIG_FILE"
     [ -s "$METADATA_FILE" ] || echo "{}" > "$METADATA_FILE"
+    
+    # [关键] 初始化 relay.json - 服务启动命令会加载这个文件
+    # 如果文件不存在，sing-box 会启动失败
+    local RELAY_CONFIG_DIR="/etc/singbox"
+    local RELAY_CONFIG_FILE="${RELAY_CONFIG_DIR}/relay.json"
+    if [ ! -d "$RELAY_CONFIG_DIR" ]; then
+        mkdir -p "$RELAY_CONFIG_DIR"
+    fi
+    if [ ! -s "$RELAY_CONFIG_FILE" ]; then
+        echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
+        _info "已初始化中转配置文件: $RELAY_CONFIG_FILE"
+    fi
     if [ ! -s "$CLASH_YAML_FILE" ]; then
         _info "正在创建全新的 clash.yaml 配置文件..."
         cat > "$CLASH_YAML_FILE" << 'EOF'
@@ -490,6 +492,66 @@ rules:
   - MATCH,节点选择
 EOF
     fi
+}
+
+_init_relay_config() {
+    local relay_conf_dir="/etc/singbox"
+    local relay_conf_file="${relay_conf_dir}/relay.json"
+    # [配置隔离] 
+    # 不再需要软链接到主目录，因为服务启动命令直接引用 /etc/singbox/relay.json
+    # 这避免了使用 -C (加载目录) 时错误加载 metadata.json 的问题
+    # local symlink_file="${SINGBOX_DIR}/relay.json"
+    # if [ ! -L "$symlink_file" ]; then ln -s "$relay_conf_file" "$symlink_file"; fi
+}
+
+_cleanup_legacy_config() {
+    # 检查并清理 config.json 中残留的旧版中转配置 (tag 以 relay-out- 开头的 outbound)
+    # 这些残留会导致路由冲突，使主脚本节点误走中转线路
+    local needs_restart=false
+    
+    if jq -e '.outbounds[] | select(.tag | startswith("relay-out-"))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "检测到舊版中转残留配置，正在清理..."
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_legacy"
+        
+        # 删除所有 relay-out- 开头的 outbounds
+        jq 'del(.outbounds[] | select(.tag | startswith("relay-out-")))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        
+        # 删除所有 relay-out- 开头的路由规则 (如果有)
+        if jq -e '.route.rules' "$CONFIG_FILE" >/dev/null 2>&1; then
+            jq 'del(.route.rules[] | select(.outbound | startswith("relay-out-")))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fi
+        
+        # 确保存在 direct 出站且位于第一位 (如果没有 direct，添加一个)
+        if ! jq -e '.outbounds[] | select(.tag == "direct")' "$CONFIG_FILE" >/dev/null 2>&1; then
+             jq '.outbounds = [{"type":"direct","tag":"direct"}] + .outbounds' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fi
+        
+        _success "配置清理完成。相关中转已被迁移至独立配置文件 (relay.json)。"
+        needs_restart=true
+    fi
+    
+    # [关键修复] 确保 route.final 设置为 "direct"
+    # 这是核心修复：当 config.json 和 relay.json 合并时，relay-out-* outbound 会被插入到 outbounds 列表前面
+    # 如果没有 route.final，sing-box 会使用列表中的第一个 outbound 作为默认出口，导致主节点流量走中转
+    if ! jq -e '.route.final == "direct"' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warn "检测到 route.final 未设置或不正确，正在修复..."
+        
+        # 确保 route 对象存在
+        if ! jq -e '.route' "$CONFIG_FILE" >/dev/null 2>&1; then
+            jq '. + {"route":{"rules":[],"final":"direct"}}' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        else
+            # 设置 route.final = "direct"
+            jq '.route.final = "direct"' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fi
+        
+        _success "route.final 已设置为 direct，主节点流量将走本机 IP。"
+        needs_restart=true
+    fi
+    
+    if [ "$needs_restart" = true ]; then
+        return 0
+    fi
+    return 1
 }
 
 _generate_self_signed_cert() {
@@ -2301,6 +2363,48 @@ main() {
     if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
          _info "检测到主配置文件缺失，正在初始化..."
          _initialize_config_files
+    fi
+
+    # 3.1 初始化中转配置 (配置隔离)
+    _init_relay_config
+    
+    # 3.2 [关键修复] 清理主配置文件中的旧版残留
+    if _cleanup_legacy_config; then
+        _manage_service restart
+    fi
+    
+    # [BUG FIX] 检查并修复旧版服务文件 (使用了 -C 的情况)
+    # 因为 metadata.json 也是 json，-C 会错误加载它导致服务失败
+    if [ -f "$SERVICE_FILE" ]; then
+        local need_update=false
+        
+        # 检查1: 是否使用了 -C 参数 (旧版目录加载模式)
+        if grep -q "\-C " "$SERVICE_FILE"; then
+            _warn "检测到旧版服务配置(目录加载模式导致冲突)，正在修复..."
+            need_update=true
+        fi
+        
+        # 检查2: OpenRC 是否缺少 command_background (新版必需的设置)
+        # 如果没有这个设置，说明是旧版服务文件，需要更新
+        if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "command_background" "$SERVICE_FILE"; then
+            _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
+            need_update=true
+        fi
+        
+        if [ "$need_update" = true ]; then
+            # 强制覆盖旧服务文件
+            if [ "$INIT_SYSTEM" == "systemd" ]; then
+                 _create_systemd_service
+                 systemctl daemon-reload
+            elif [ "$INIT_SYSTEM" == "openrc" ]; then
+                 _create_openrc_service
+            fi
+            # 标记需要重启
+            if systemctl is-active sing-box >/dev/null 2>&1 || rc-service sing-box status >/dev/null 2>&1; then
+                _manage_service restart
+            fi
+            _success "服务配置修复完成。"
+        fi
     fi
 
     # 4. 如果是首次安装，才创建服务和启动
