@@ -24,7 +24,7 @@ INIT_SYSTEM="" # 将存储 'systemd', 'openrc' 或 'direct'
 SERVICE_FILE="" # 将根据 INIT_SYSTEM 设置
 
 # 脚本元数据
-SCRIPT_VERSION="6.0" 
+SCRIPT_VERSION="7.0" 
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh" 
 
 # 全局状态变量
@@ -923,6 +923,158 @@ _add_trojan_ws_tls() {
     fi
 }
 
+_add_anytls() {
+    _info "--- 添加 AnyTLS 节点 ---"
+    _info "AnyTLS 是一种基于 TLS 的协议，支持流量填充以对抗检测。"
+    echo ""
+    
+    # --- 步骤 1: 服务器地址 ---
+    read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+    local node_ip=${custom_ip:-$server_ip}
+    
+    # --- 步骤 2: 监听端口 ---
+    read -p "请输入监听端口: " port
+    [[ -z "$port" ]] && _error "端口不能为空" && return 1
+    
+    # --- 步骤 3: 伪装域名 (用于证书和SNI) ---
+    read -p "请输入伪装域名/SNI (默认: www.microsoft.com): " camouflage_domain
+    local server_name=${camouflage_domain:-"www.microsoft.com"}
+    
+    # --- 步骤 4: 证书选择 ---
+    echo ""
+    echo "请选择证书类型:"
+    echo "  1) 自动生成自签名证书 (推荐)"
+    echo "  2) 手动上传证书文件 (Cloudflare源证书等)"
+    read -p "请选择 [1-2] (默认: 1): " cert_choice
+    cert_choice=${cert_choice:-1}
+    
+    local cert_path=""
+    local key_path=""
+    local skip_verify=true  # 默认跳过验证 (自签证书需要)
+    local tag="anytls-in-${port}"
+    
+    if [ "$cert_choice" == "1" ]; then
+        # 自签名证书
+        cert_path="${SINGBOX_DIR}/${tag}.pem"
+        key_path="${SINGBOX_DIR}/${tag}.key"
+        _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
+        _info "已生成自签名证书，客户端将跳过证书验证。"
+    else
+        # 手动上传证书
+        _info "请输入 ${server_name} 对应的证书文件路径。"
+        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
+        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
+        
+        read -p "请输入私钥文件 .key 的完整路径: " key_path
+        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
+        
+        # 询问是否跳过验证
+        read -p "$(echo -e ${YELLOW}"您是否正在使用自签名证书或Cloudflare源证书? (y/N): "${NC})" use_self_signed
+        if [[ "$use_self_signed" == "y" || "$use_self_signed" == "Y" ]]; then
+            skip_verify=true
+            _warning "已启用 'skip-cert-verify: true'，客户端将跳过证书验证。"
+        else
+            skip_verify=false
+        fi
+    fi
+    
+    # --- 步骤 5: 密码 (UUID 格式) ---
+    read -p "请输入密码/UUID (回车则随机生成): " password
+    if [ -z "$password" ]; then
+        # AnyTLS 密码使用 UUID 格式
+        password=$(${SINGBOX_BIN} generate uuid)
+        _info "已为您生成随机 UUID: ${password}"
+    fi
+    
+    # --- 步骤 6: 自定义名称 ---
+    local default_name="AnyTLS-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    
+    # IPv6 处理
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"
+    [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    
+    # --- 生成 Inbound 配置 (包含 padding_scheme) ---
+    # padding_scheme 是 AnyTLS 的核心功能，用于流量填充对抗检测
+    local inbound_json=$(jq -n \
+        --arg t "$tag" \
+        --arg p "$port" \
+        --arg pw "$password" \
+        --arg sn "$server_name" \
+        --arg cp "$cert_path" \
+        --arg kp "$key_path" \
+        '{
+            "type": "anytls",
+            "tag": $t,
+            "listen": "::",
+            "listen_port": ($p|tonumber),
+            "users": [{"name": "default", "password": $pw}],
+            "padding_scheme": [
+                "stop=8",
+                "0=30-30",
+                "1=100-400",
+                "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+                "3=9-9,500-1000",
+                "4=500-1000",
+                "5=500-1000",
+                "6=500-1000",
+                "7=500-1000"
+            ],
+            "tls": {
+                "enabled": true,
+                "server_name": $sn,
+                "certificate_path": $cp,
+                "key_path": $kp
+            }
+        }')
+    
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
+    
+    # --- 生成 Clash YAML 配置 ---
+    # 根据用户提供的格式：包含 client-fingerprint, udp, alpn
+    local proxy_json=$(jq -n \
+        --arg n "$name" \
+        --arg s "$yaml_ip" \
+        --arg p "$port" \
+        --arg pw "$password" \
+        --arg sn "$server_name" \
+        --arg skip_verify_bool "$skip_verify" \
+        '{
+            "name": $n,
+            "type": "anytls",
+            "server": $s,
+            "port": ($p|tonumber),
+            "password": $pw,
+            "client-fingerprint": "chrome",
+            "udp": true,
+            "idle-session-check-interval": 30,
+            "idle-session-timeout": 30,
+            "min-idle-session": 0,
+            "sni": $sn,
+            "alpn": ["h2", "http/1.1"],
+            "skip-cert-verify": ($skip_verify_bool == "true")
+        }')
+    
+    _add_node_to_yaml "$proxy_json"
+    
+    # --- 保存元数据 ---
+    local meta_json=$(jq -n \
+        --arg sn "$server_name" \
+        '{server_name: $sn}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+    
+    # --- 生成分享链接 ---
+    local insecure_param=""
+    if [ "$skip_verify" == "true" ]; then
+        insecure_param="&insecure=1&allowInsecure=1"
+    fi
+    local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
+    
+    _success "AnyTLS 节点 [${name}] 添加成功!"
+}
+
 _add_vless_reality() {
     read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
     local node_ip=${custom_ip:-$server_ip}
@@ -1245,6 +1397,17 @@ _view_nodes() {
                 # [!] 已修改：使用 display_name
                 url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
                 ;;
+            "anytls")
+                local pw=$(echo "$node" | jq -r '.users[0].password')
+                local sn=$(echo "$node" | jq -r '.tls.server_name')
+                local skip_verify=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .skip-cert-verify' ${CLASH_YAML_FILE} | head -n 1)
+                local insecure_param=""
+                if [ "$skip_verify" == "true" ]; then
+                    insecure_param="&insecure=1&allowInsecure=1"
+                fi
+                # [!] 生成 AnyTLS 分享链接
+                url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
+                ;;
             "shadowsocks")
                 local method=$(echo "$node" | jq -r '.method')
                 local password=$(echo "$node" | jq -r '.password')
@@ -1362,8 +1525,8 @@ _delete_node() {
         _remove_node_from_yaml "$proxy_name_to_del"
     fi
 
-    # 证书清理逻辑不变 (基于 tag)，这是正确的
-    if [ "$type_to_del" == "hysteria2" ] || [ "$type_to_del" == "tuic" ]; then
+    # 证书清理逻辑 - 包含 hysteria2, tuic, anytls (基于 tag)
+    if [ "$type_to_del" == "hysteria2" ] || [ "$type_to_del" == "tuic" ] || [ "$type_to_del" == "anytls" ]; then
         local cert_to_del="${SINGBOX_DIR}/${tag_to_del}.pem"
         local key_to_del="${SINGBOX_DIR}/${tag_to_del}.key"
         if [ -f "$cert_to_del" ] || [ -f "$key_to_del" ]; then
@@ -1518,8 +1681,8 @@ _modify_port() {
         _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == "'${proxy_name_in_yaml}'") | .port) = '${new_port}
     fi
     
-    # 3. 处理证书文件重命名（仅 Hysteria2 和 TUIC）
-    if [ "$type_to_modify" == "hysteria2" ] || [ "$type_to_modify" == "tuic" ]; then
+    # 3. 处理证书文件重命名（Hysteria2, TUIC, AnyTLS）
+    if [ "$type_to_modify" == "hysteria2" ] || [ "$type_to_modify" == "tuic" ] || [ "$type_to_modify" == "anytls" ]; then
         local old_cert="${SINGBOX_DIR}/${tag_to_modify}.pem"
         local old_key="${SINGBOX_DIR}/${tag_to_modify}.key"
         
@@ -1527,8 +1690,10 @@ _modify_port() {
         local new_tag_suffix="$new_port"
         if [ "$type_to_modify" == "hysteria2" ]; then
             local new_tag="hy2-in-${new_tag_suffix}"
-        else
+        elif [ "$type_to_modify" == "tuic" ]; then
             local new_tag="tuic-in-${new_tag_suffix}"
+        else
+            local new_tag="anytls-in-${new_tag_suffix}"
         fi
         
         local new_cert="${SINGBOX_DIR}/${new_tag}.pem"
@@ -2144,7 +2309,7 @@ _create_third_party_adapter() {
 
 # 新增更新脚本及SingBox核心
 _update_script() {
-    _info "--- 更新此管理脚本 ---"
+    _info "--- 更新管理脚本 ---"
     
     if [ "$SCRIPT_UPDATE_URL" == "YOUR_GITHUB_RAW_URL_HERE/singbox.sh" ]; then
         _error "错误：您尚未在脚本中配置 SCRIPT_UPDATE_URL 变量。"
@@ -2152,28 +2317,52 @@ _update_script() {
         return 1
     fi
 
-    _info "正在从 GitHub 下载最新脚本..."
+    # 更新主脚本
+    _info "正在从 GitHub 下载主脚本..."
     local temp_script_path="${SELF_SCRIPT_PATH}.tmp"
     
     if wget -qO "$temp_script_path" "$SCRIPT_UPDATE_URL"; then
         if [ ! -s "$temp_script_path" ]; then
-            _error "下载失败或文件为空！请检查您的 SCRIPT_UPDATE_URL 链接。"
+            _error "主脚本下载失败或文件为空！"
             rm -f "$temp_script_path"
             return 1
         fi
         
-        # 赋予执行权限并替换旧脚本
         chmod +x "$temp_script_path"
         mv "$temp_script_path" "$SELF_SCRIPT_PATH"
-        _success "脚本更新成功！"
-        _info "请重新运行脚本以加载新版本："
-        echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
-        exit 0
+        _success "主脚本 (singbox.sh) 更新成功！"
     else
-        _error "下载失败！请检查网络或 GitHub 链接。"
+        _error "主脚本下载失败！请检查网络或 GitHub 链接。"
         rm -f "$temp_script_path"
         return 1
     fi
+    
+    # 更新子脚本 (advanced_relay.sh)
+    local sub_script_name="advanced_relay.sh"
+    local sub_script_path="/root/${sub_script_name}"
+    local sub_script_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${sub_script_name}"
+    
+    _info "正在从 GitHub 下载子脚本..."
+    local temp_sub_path="${sub_script_path}.tmp"
+    
+    if wget -qO "$temp_sub_path" "$sub_script_url"; then
+        if [ -s "$temp_sub_path" ]; then
+            chmod +x "$temp_sub_path"
+            mv "$temp_sub_path" "$sub_script_path"
+            _success "子脚本 (advanced_relay.sh) 更新成功！"
+        else
+            _warning "子脚本下载失败或文件为空，跳过更新。"
+            rm -f "$temp_sub_path"
+        fi
+    else
+        _warning "子脚本下载失败，跳过更新。进阶功能可能使用旧版本。"
+        rm -f "$temp_sub_path"
+    fi
+    
+    _success "脚本更新完成！"
+    _info "请重新运行脚本以加载新版本："
+    echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
+    exit 0
 }
 
 _update_singbox_core() {
@@ -2211,7 +2400,6 @@ _advanced_features() {
     # 如果都不存在，则下载
     if [ ! -f "$script_path" ]; then
         _info "本地未检测到进阶脚本，正在尝试下载..."
-        # 假设用户仓库的 main 分支
         local download_url="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/${script_name}"
         
         if wget -qO "$script_path" "$download_url"; then
@@ -2302,25 +2490,27 @@ _show_add_node_menu() {
     echo " 1) VLESS (Vision+REALITY)"
     echo " 2) VLESS (WebSocket+TLS)"
     echo " 3) Trojan (WebSocket+TLS)"
-    echo " 4) VLESS (TCP)"
+    echo " 4) AnyTLS"
     echo " 5) Hysteria2"
     echo " 6) TUICv5"
     echo " 7) Shadowsocks"
-    echo " 8) SOCKS5"
+    echo " 8) VLESS (TCP)"
+    echo " 9) SOCKS5"
     echo "----------------------------------------"
     echo " 0) 返回主菜单"
     echo "========================================"
-    read -p "请输入选项 [0-8]: " choice
+    read -p "请输入选项 [0-9]: " choice
 
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
-		3) _add_trojan_ws_tls; action_result=$? ;;
-        4) _add_vless_tcp; action_result=$? ;;
+        3) _add_trojan_ws_tls; action_result=$? ;;
+        4) _add_anytls; action_result=$? ;;
         5) _add_hysteria2; action_result=$? ;;
         6) _add_tuic; action_result=$? ;;
         7) _add_shadowsocks_menu; action_result=$? ;;
-        8) _add_socks; action_result=$? ;;
+        8) _add_vless_tcp; action_result=$? ;;
+        9) _add_socks; action_result=$? ;;
         0) return ;;
         *) _error "无效输入，请重试。" ;;
     esac
