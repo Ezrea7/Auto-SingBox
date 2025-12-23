@@ -78,15 +78,31 @@ _get_public_ip() {
 # --- 系统环境适配 ---
 
 _detect_init_system() {
-    if [ -f "/sbin/openrc-run" ]; then
+    # 优先检测 OpenRC (Alpine Linux 等)
+    if [ -f "/sbin/openrc-run" ] || command -v rc-service &>/dev/null; then
         INIT_SYSTEM="openrc"
         SERVICE_FILE="/etc/init.d/sing-box"
-    elif [ -d "/run/systemd/system" ] && command -v systemctl &>/dev/null; then
-        INIT_SYSTEM="systemd"
-        SERVICE_FILE="/etc/systemd/system/sing-box.service"
+    # 检测 systemd - 使用多种方式确保准确性
+    elif command -v systemctl &>/dev/null; then
+        # 检查 systemd 是否真正在运行
+        if [ -d "/run/systemd/system" ] || systemctl is-system-running &>/dev/null; then
+            INIT_SYSTEM="systemd"
+            SERVICE_FILE="/etc/systemd/system/sing-box.service"
+        # 备用检测：检查 PID 1 进程
+        elif [ -f "/proc/1/comm" ] && grep -q "systemd" /proc/1/comm 2>/dev/null; then
+            INIT_SYSTEM="systemd"
+            SERVICE_FILE="/etc/systemd/system/sing-box.service"
+        else
+            _error "错误：检测到 systemctl 命令，但 systemd 似乎未在运行。"
+            _error "您可能在容器或 WSL 环境中运行。"
+            _error "PID 1 进程: $(cat /proc/1/comm 2>/dev/null || echo '无法读取')"
+            exit 1
+        fi
     else
         _error "错误：未检测到 systemd 或 OpenRC 初始化系统。"
-        _error "本脚本已不再支持 Direct (直接进程) 模式，请确保您的系统支持服务管理。"
+        _error "本脚本需要 systemd 或 OpenRC 来管理服务。"
+        _error "系统信息: $(uname -a)"
+        [ -f "/proc/1/comm" ] && _error "PID 1 进程: $(cat /proc/1/comm)"
         exit 1
     fi
     _info "检测到管理模式为: ${INIT_SYSTEM}"
@@ -1341,10 +1357,11 @@ _view_nodes() {
                     local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
                     local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
                     local client_port=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .port' ${CLASH_YAML_FILE} | head -n 1)
+                    local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .servername' ${CLASH_YAML_FILE} | head -n 1)
                     local ws_path=$(echo "$node" | jq -r '.transport.path')
                     local encoded_path=$(_url_encode "$ws_path")
-                    # [!] 已修改：使用 display_name
-                    url="vless://${uuid}@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}#$(_url_encode "$display_name")"
+                    # [!] 已修改：使用 display_name，添加 sni 参数
+                    url="vless://${uuid}@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}&sni=${sni}#$(_url_encode "$display_name")"
                 elif [ "$(echo "$node" | jq -r '.tls.reality.enabled')" == "true" ]; then
                     # VLESS + REALITY
                     local sn=$(echo "$node" | jq -r '.tls.server_name'); local flow=$(echo "$node" | jq -r '.users[0].flow')
